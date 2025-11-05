@@ -1,3 +1,4 @@
+//0.7.1
 /*!
 <div align="center">
     <img src="https://raw.githubusercontent.com/litesvm/litesvm/master/logo.jpeg" width="50%" height="50%">
@@ -260,7 +261,6 @@ use solana_sysvar::recent_blockhashes::IterItem;
 #[allow(deprecated)]
 use solana_sysvar::{fees::Fees, recent_blockhashes::RecentBlockhashes};
 use solana_program_runtime::invoke_context;
-use std::cell::Ref;
 use {
     crate::{
         accounts_db::AccountsDb,
@@ -453,10 +453,13 @@ impl LiteSVM {
         self.set_sysvar(&SlotHistory::default());
         self.set_sysvar(&StakeHistory::default());
     }
-    pub fn with_trace_collector(mut self, trace_collector: Rc<RefCell<dyn TraceCollector>>) -> Self {
-        self.set_trace_collector(trace_collector);
-        self
-    }
+    pub fn with_trace_collector(
+            mut self,
+            trace_collector: Rc<RefCell<dyn TraceCollector>>,
+        ) -> Self {
+            self.set_trace_collector(trace_collector);
+            self
+        }
 
     fn set_trace_collector(&mut self, trace_collector: Rc<RefCell<dyn TraceCollector>>) {
         self.trace_collector = Some(trace_collector);
@@ -498,12 +501,18 @@ impl LiteSVM {
             }
         });
 
-        let compute_budget = self.compute_budget.unwrap_or_default();
+        // Use a consistent max compute budget for runtime environments to ensure tracing works
+        let compute_budget = ComputeBudget {
+            compute_unit_limit: u64::MAX,
+            heap_size: 256 * 1024,
+            ..ComputeBudget::default()
+        };
+        
         let program_runtime_v1 = create_program_runtime_environment_v1(
             &self.feature_set.runtime_features(),
             &compute_budget.to_budget(),
             false,
-            false,
+            true,  // ✅ CRITICAL: Enable instruction tracing
         )
         .unwrap();
 
@@ -962,26 +971,24 @@ impl LiteSVM {
             .collect::<Result<Vec<Vec<u16>>, TransactionError>>();
         match maybe_program_indices {
             Ok(program_indices) => {
-                let mut context = self.create_transaction_context(compute_budget, accounts.clone());
-                let mut tx_result = {
-                    
-                let mut context = self.create_transaction_context(compute_budget, accounts);
                 let feature_set = self.feature_set.runtime_features();
-                let mut invoke_context = InvokeContext::new(
-                    &mut context,
-                    &mut program_cache_for_tx_batch,
-                    EnvironmentConfig::new(
-                        *blockhash,
-                        self.fee_structure.lamports_per_signature,
-                        self,
-                        &feature_set,
-                        &self.accounts.sysvar_cache,
-                    ),
-                    Some(log_collector),
-                    compute_budget.to_budget(),
-                    SVMTransactionExecutionCost::default(),
-                );
-                    
+                let mut context = self.create_transaction_context(compute_budget, accounts);
+                let mut tx_result = {
+                    let mut invoke_context = InvokeContext::new(
+                        &mut context,
+                        &mut program_cache_for_tx_batch,
+                        EnvironmentConfig::new(
+                            *blockhash,
+                            self.fee_structure.lamports_per_signature,
+                            self,
+                            &feature_set,
+                            &self.accounts.sysvar_cache,
+                        ),
+                        Some(log_collector),
+                        compute_budget.to_budget(),
+                        SVMTransactionExecutionCost::default()
+                    );
+
                     let result = process_message(
                         tx.message(),
                         &program_indices,
@@ -990,8 +997,9 @@ impl LiteSVM {
                         &mut accumulated_consume_units,
                     )
                     .map(|_| ());
-
+                    println!("Here");
                     if let Some(trace_collector) = trace_collector {
+                        println!("Here123");
                         trace_collector.borrow_mut().trace(tx.message(), invoke_context.get_traces());
                     }
 
@@ -1148,8 +1156,13 @@ impl LiteSVM {
         self.maybe_blockhash_check(sanitized_tx)?;
         let compute_budget_limits = get_compute_budget_limits(sanitized_tx, &self.feature_set)?;
         self.maybe_history_check(sanitized_tx)?;
-        let (result, compute_units_consumed, context, fee, payer_key) =
-            self.process_transaction(sanitized_tx, compute_budget_limits, log_collector, trace_collector);
+        let (result, compute_units_consumed, context, fee, payer_key) = self.process_transaction(
+            sanitized_tx,
+            compute_budget_limits,
+            log_collector,
+            trace_collector,
+        );
+
         Ok(CheckAndProcessTransactionSuccess {
             core: {
                 CheckAndProcessTransactionSuccessCore {
