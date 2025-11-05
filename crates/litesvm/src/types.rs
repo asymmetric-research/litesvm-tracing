@@ -2,7 +2,7 @@ use {
     crate::format_logs::format_logs,
     solana_account::AccountSharedData,
     solana_instruction::error::InstructionError,
-    solana_message::inner_instruction::InnerInstructionsList,
+    solana_message::{inner_instruction::InnerInstructionsList, SanitizedMessage},
     solana_program_error::ProgramError,
     solana_pubkey::Pubkey,
     solana_signature::Signature,
@@ -25,6 +25,10 @@ impl TransactionMetadata {
     pub fn pretty_logs(&self) -> String {
         format_logs(&self.logs)
     }
+}
+pub trait TraceCollector {
+    fn trace(&mut self, message: &SanitizedMessage, traces: &[Vec<[u64; 12]>]);
+
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]

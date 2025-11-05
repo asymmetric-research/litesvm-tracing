@@ -259,6 +259,8 @@ use qualifier_attr::qualifiers;
 use solana_sysvar::recent_blockhashes::IterItem;
 #[allow(deprecated)]
 use solana_sysvar::{fees::Fees, recent_blockhashes::RecentBlockhashes};
+use solana_program_runtime::invoke_context;
+use std::cell::Ref;
 use {
     crate::{
         accounts_db::AccountsDb,
@@ -274,6 +276,7 @@ use {
             rent::{check_rent_state_with_account, get_account_rent_state},
         },
     },
+    types::TraceCollector,
     agave_feature_set::FeatureSet,
     agave_reserved_account_keys::ReservedAccountKeys,
     itertools::Itertools,
@@ -358,6 +361,7 @@ pub struct LiteSVM {
     blockhash_check: bool,
     fee_structure: FeeStructure,
     log_bytes_limit: Option<usize>,
+    trace_collector: Option<Rc<RefCell<dyn TraceCollector>>>
 }
 
 impl Default for LiteSVM {
@@ -373,6 +377,7 @@ impl Default for LiteSVM {
             blockhash_check: false,
             fee_structure: FeeStructure::default(),
             log_bytes_limit: Some(10_000),
+            trace_collector: None,
         }
     }
 }
@@ -447,6 +452,14 @@ impl LiteSVM {
         )]));
         self.set_sysvar(&SlotHistory::default());
         self.set_sysvar(&StakeHistory::default());
+    }
+    pub fn with_trace_collector(mut self, trace_collector: Rc<RefCell<dyn TraceCollector>>) -> Self {
+        self.set_trace_collector(trace_collector);
+        self
+    }
+
+    fn set_trace_collector(&mut self, trace_collector: Rc<RefCell<dyn TraceCollector>>) {
+        self.trace_collector = Some(trace_collector);
     }
 
     /// Includes the default sysvars.
@@ -807,6 +820,7 @@ impl LiteSVM {
         tx: &SanitizedTransaction,
         compute_budget_limits: ComputeBudgetLimits,
         log_collector: Rc<RefCell<LogCollector>>,
+        trace_collector: Option<Rc<RefCell<dyn TraceCollector>>>,
     ) -> (
         Result<(), TransactionError>,
         u64,
@@ -948,6 +962,9 @@ impl LiteSVM {
             .collect::<Result<Vec<Vec<u16>>, TransactionError>>();
         match maybe_program_indices {
             Ok(program_indices) => {
+                let mut context = self.create_transaction_context(compute_budget, accounts.clone());
+                let mut tx_result = {
+                    
                 let mut context = self.create_transaction_context(compute_budget, accounts);
                 let feature_set = self.feature_set.runtime_features();
                 let mut invoke_context = InvokeContext::new(
@@ -964,15 +981,23 @@ impl LiteSVM {
                     compute_budget.to_budget(),
                     SVMTransactionExecutionCost::default(),
                 );
-                let mut tx_result = process_message(
-                    tx.message(),
-                    &program_indices,
-                    &mut invoke_context,
-                    &mut ExecuteTimings::default(),
-                    &mut accumulated_consume_units,
-                )
-                .map(|_| ());
+                    
+                    let result = process_message(
+                        tx.message(),
+                        &program_indices,
+                        &mut invoke_context,
+                        &mut ExecuteTimings::default(),
+                        &mut accumulated_consume_units,
+                    )
+                    .map(|_| ());
 
+                    if let Some(trace_collector) = trace_collector {
+                        trace_collector.borrow_mut().trace(tx.message(), invoke_context.get_traces());
+                    }
+
+                    result
+                };                
+                
                 if let Err(err) = self.check_accounts_rent(tx, &context) {
                     tx_result = Err(err);
                 };
@@ -1025,14 +1050,14 @@ impl LiteSVM {
         }
         Ok(())
     }
-
     fn execute_transaction_no_verify(
         &mut self,
         tx: VersionedTransaction,
         log_collector: Rc<RefCell<LogCollector>>,
+        trace_collector: Option<Rc<RefCell<dyn TraceCollector>>>
     ) -> ExecutionResult {
         map_sanitize_result(self.sanitize_transaction_no_verify(tx), |s_tx| {
-            self.execute_sanitized_transaction(s_tx, log_collector)
+            self.execute_sanitized_transaction(s_tx, log_collector, trace_collector)
         })
     }
 
@@ -1040,9 +1065,10 @@ impl LiteSVM {
         &mut self,
         tx: VersionedTransaction,
         log_collector: Rc<RefCell<LogCollector>>,
+        trace_collector: Option<Rc<RefCell<dyn TraceCollector>>>
     ) -> ExecutionResult {
         map_sanitize_result(self.sanitize_transaction(tx), |s_tx| {
-            self.execute_sanitized_transaction(s_tx, log_collector)
+            self.execute_sanitized_transaction(s_tx, log_collector, trace_collector)
         })
     }
 
@@ -1050,6 +1076,7 @@ impl LiteSVM {
         &mut self,
         sanitized_tx: SanitizedTransaction,
         log_collector: Rc<RefCell<LogCollector>>,
+        trace_collector: Option<Rc<RefCell<dyn TraceCollector>>>
     ) -> ExecutionResult {
         let CheckAndProcessTransactionSuccess {
             core:
@@ -1060,7 +1087,7 @@ impl LiteSVM {
                 },
             fee,
             payer_key,
-        } = match self.check_and_process_transaction(&sanitized_tx, log_collector) {
+        } = match self.check_and_process_transaction(&sanitized_tx, log_collector, trace_collector) {
             Ok(value) => value,
             Err(value) => return value,
         };
@@ -1076,6 +1103,7 @@ impl LiteSVM {
         &self,
         sanitized_tx: SanitizedTransaction,
         log_collector: Rc<RefCell<LogCollector>>,
+        trace_collector: Option<Rc<RefCell<dyn TraceCollector>>>
     ) -> ExecutionResult {
         let CheckAndProcessTransactionSuccess {
             core:
@@ -1085,7 +1113,7 @@ impl LiteSVM {
                     context,
                 },
             ..
-        } = match self.check_and_process_transaction(&sanitized_tx, log_collector) {
+        } = match self.check_and_process_transaction(&sanitized_tx, log_collector, trace_collector) {
             Ok(value) => value,
             Err(value) => return value,
         };
@@ -1115,12 +1143,13 @@ impl LiteSVM {
         &self,
         sanitized_tx: &SanitizedTransaction,
         log_collector: Rc<RefCell<LogCollector>>,
+        trace_collector: Option<Rc<RefCell<dyn TraceCollector>>>
     ) -> Result<CheckAndProcessTransactionSuccess, ExecutionResult> {
         self.maybe_blockhash_check(sanitized_tx)?;
         let compute_budget_limits = get_compute_budget_limits(sanitized_tx, &self.feature_set)?;
         self.maybe_history_check(sanitized_tx)?;
         let (result, compute_units_consumed, context, fee, payer_key) =
-            self.process_transaction(sanitized_tx, compute_budget_limits, log_collector);
+            self.process_transaction(sanitized_tx, compute_budget_limits, log_collector, trace_collector);
         Ok(CheckAndProcessTransactionSuccess {
             core: {
                 CheckAndProcessTransactionSuccessCore {
@@ -1161,9 +1190,10 @@ impl LiteSVM {
         &self,
         tx: VersionedTransaction,
         log_collector: Rc<RefCell<LogCollector>>,
+        trace_collector: Option<Rc<RefCell<dyn TraceCollector>>>
     ) -> ExecutionResult {
         map_sanitize_result(self.sanitize_transaction(tx), |s_tx| {
-            self.execute_sanitized_transaction_readonly(s_tx, log_collector)
+            self.execute_sanitized_transaction_readonly(s_tx, log_collector, trace_collector)
         })
     }
 
@@ -1171,9 +1201,10 @@ impl LiteSVM {
         &self,
         tx: VersionedTransaction,
         log_collector: Rc<RefCell<LogCollector>>,
+        trace_collector: Option<Rc<RefCell<dyn TraceCollector>>>
     ) -> ExecutionResult {
         map_sanitize_result(self.sanitize_transaction_no_verify(tx), |s_tx| {
-            self.execute_sanitized_transaction_readonly(s_tx, log_collector)
+            self.execute_sanitized_transaction_readonly(s_tx, log_collector, trace_collector)
         })
     }
 
@@ -1194,13 +1225,14 @@ impl LiteSVM {
             return_data,
             included,
         } = if self.sigverify {
-            self.execute_transaction(vtx, log_collector.clone())
+            self.execute_transaction(vtx, log_collector.clone(), self.trace_collector.clone())
         } else {
-            self.execute_transaction_no_verify(vtx, log_collector.clone())
+            self.execute_transaction_no_verify(vtx, log_collector.clone(), self.trace_collector.clone())
         };
         let Ok(logs) = Rc::try_unwrap(log_collector).map(|lc| lc.into_inner().messages) else {
             unreachable!("Log collector should not be used after send_transaction returns")
         };
+
         let meta = TransactionMetadata {
             logs,
             inner_instructions,
@@ -1245,13 +1277,14 @@ impl LiteSVM {
             return_data,
             ..
         } = if self.sigverify {
-            self.execute_transaction_readonly(tx.into(), log_collector.clone())
+            self.execute_transaction_readonly(tx.into(), log_collector.clone(), self.trace_collector.clone())
         } else {
-            self.execute_transaction_no_verify_readonly(tx.into(), log_collector.clone())
+            self.execute_transaction_no_verify_readonly(tx.into(), log_collector.clone(), self.trace_collector.clone())
         };
         let Ok(logs) = Rc::try_unwrap(log_collector).map(|lc| lc.into_inner().messages) else {
             unreachable!("Log collector should not be used after simulate_transaction returns")
         };
+
         let meta = TransactionMetadata {
             signature,
             logs,
