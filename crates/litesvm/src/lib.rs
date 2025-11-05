@@ -997,9 +997,7 @@ impl LiteSVM {
                         &mut accumulated_consume_units,
                     )
                     .map(|_| ());
-                    println!("Here");
                     if let Some(trace_collector) = trace_collector {
-                        println!("Here123");
                         trace_collector.borrow_mut().trace(tx.message(), invoke_context.get_traces());
                     }
 
